@@ -1,0 +1,159 @@
+#!/usr/bin/env python
+import argparse
+import signal
+import logging
+import time
+from logline import LogLine
+from logstats import LogStats
+from logalerts import LogAlerts
+from proxymanager import ProxyManager
+import logutils
+from logging import handlers
+from ConfigParser import ConfigParser
+
+''' Setting up a logger '''
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+
+# create a file handler
+handler = handlers.RotatingFileHandler('logmonitor.log', maxBytes=1024*1024*10)  # max size = 10 MB
+handler.setLevel(logging.INFO)
+
+# create a logging format
+formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+handler.setFormatter(formatter)
+
+# add the handlers to the logger
+logger.addHandler(handler)
+
+# Used for graceful shutdown
+shutdown_flag = False
+
+stats = LogStats()
+proxy_manager = ProxyManager()
+
+# Configuration file
+conf_file = "logmonitor.conf"
+
+# Default values if not in config file
+interval = 10
+percentile = 95
+traffic_threshold_time = 60
+
+
+def sighandler(signum, frame):
+    global shutdown_flag
+    logger.info('Program terminated: signal handler called with signal: %s ' % signum)
+    shutdown_flag = True
+    stats.print_stats(percentile)
+
+
+def extract_info_for_stats_and_alert(line, alerts):
+    try:
+        # Parse line
+        client, proxies,  req_date, req_info, status_code, time_process = logutils.parse_string(line)
+        # Parse request
+        req_method, req_path, req_protocol = logutils.parse_request_info(req_info)
+
+        # Create new instance of LogLine and count stats
+        arrival_time = int(time.time())
+        written_line = LogLine(client, req_date, req_method, req_path, req_protocol, status_code, time_process, proxies, arrival_time)
+        stats.count_stats(written_line)
+
+        # Traffic limit alert management
+        alerts.add_request_to_traffic_threshold(arrival_time, True)
+
+        # Find inefficient proxies
+        proxy_manager.find_inefficient_proxies(written_line)
+
+    except AttributeError, e:
+        print "Ignoring line (wrong format): " + line
+        logger.error(e)
+        return
+
+
+def read_configuration(conf_file):
+    global interval
+    global percentile
+    global traffic_threshold_time
+
+    config = ConfigParser()
+    config.read(conf_file)
+
+    if config.has_option('Logmonitor', 'Stats_interval'):
+        try:
+            interval = config.getint('Logmonitor', 'Stats_interval')
+        except ValueError, e:
+            logger.error(e)
+            print 'Invalid stats_interval value (int): using default'
+
+    if config.has_option('Logmonitor', 'Percentile'):
+        try:
+            percentile = config.getint('Logmonitor', 'Percentile')
+        except ValueError, e:
+            logger.error(e)
+            print 'Invalid percentile value (int): using default'
+
+    if config.has_option('Logmonitor', 'Traffic_threshold_time'):
+        try:
+            traffic_threshold_time = config.getint('Logmonitor', 'Traffic_threshold_time')
+        except ValueError, e:
+            logger.error(e)
+            print 'Invalid Traffic_threshold_time value (int): using default'
+
+
+def main():
+    logger.info("Starting log monitor")
+
+    # Check program arguments
+    parser = argparse.ArgumentParser()
+    parser.add_argument("log_file", help="path to a file",
+                        type=argparse.FileType('r'))
+    parser.add_argument("traffic_threshold", help="integer parameter",
+                        type=int)
+    args = parser.parse_args()
+    log_file = args.log_file
+    threshold = args.traffic_threshold
+
+    # Read configuration file
+    read_configuration(conf_file)
+
+    # Signals
+    signal.signal(signal.SIGTERM, sighandler)  # handle kill gracefully
+    signal.signal(signal.SIGINT, sighandler)  # handle ctrl-c
+
+    # Take the end of the file as the reference position: ignore old lines
+    log_file.seek(0, 2)
+
+    previous_step_time = int(time.time())
+    past_status_alert = False
+
+    alerts = LogAlerts(traffic_threshold_time)  # 60 seconds
+
+    alerts.initialize_traffic_queue()
+
+    while not shutdown_flag:
+        where = log_file.tell()
+        line = log_file.readline()
+
+        # Print stats every 10 seconds
+        current_time = int(time.time())
+        if current_time - previous_step_time >= interval:
+            stats.print_stats(percentile)
+            stats.reset_stats()
+            previous_step_time = current_time
+
+        # Detect threshold violations and alert
+        past_status_alert = alerts.traffic_alert(threshold, current_time, past_status_alert)
+
+        # Detect new lines
+        if not line:
+            log_file.seek(where)
+            alerts.add_request_to_traffic_threshold(int(time.time()), False)  # Append 0 requests for alert
+            time.sleep(1)
+        else:  # new line inserted
+            if not line == '\n':
+                extract_info_for_stats_and_alert(line, alerts)
+
+if __name__ == "__main__":
+    main()
